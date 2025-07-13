@@ -1,0 +1,186 @@
+import gspread
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+import os
+import time
+import re
+from openai import OpenAI
+
+client = OpenAI()  # Uses OPENAI_API_KEY from environment
+
+SCOPES = [
+    'https://www.googleapis.com/auth/drive',
+    'https://www.googleapis.com/auth/spreadsheets',
+    'https://www.googleapis.com/auth/documents.readonly'
+]
+creds = Credentials.from_service_account_file('creds.json', scopes=SCOPES)
+gc = gspread.authorize(creds)
+SHEET_NAME = 'Video Master Dashboard'
+spreadsheet = gc.open(SHEET_NAME)
+worksheet = spreadsheet.worksheet('Video Master Dashboard')
+drive_service = build('drive', 'v3', credentials=creds)
+docs_service = build('docs', 'v1', credentials=creds)
+
+VIDEO_FOLDER = 'Video Uploads'
+TRANSCRIPT_FOLDER = 'Transcripts'
+
+def make_hyperlink(url, label):
+    return f'=HYPERLINK("{url}", "{label}")' if url else ""
+
+def get_folder_id(folder_name):
+    response = drive_service.files().list(
+        q=f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder'",
+        spaces='drive',
+        fields='files(id, name)'
+    ).execute()
+    items = response.get('files', [])
+    if not items:
+        raise Exception(f"Folder '{folder_name}' not found.")
+    return items[0]['id']
+
+def list_files_in_folder(folder_id, file_mime=None):
+    query = f"'{folder_id}' in parents"
+    if file_mime:
+        query += f" and mimeType='{file_mime}'"
+    response = drive_service.files().list(
+        q=query,
+        fields="files(id, name, webViewLink, mimeType)"
+    ).execute()
+    return response.get('files', [])
+
+def find_transcript_for_video(transcripts, video_title):
+    vid_title = video_title.rsplit('.', 1)[0].strip().lower()
+    for transcript in transcripts:
+        doc_name = transcript['name'].strip().lower()
+        if doc_name == vid_title:
+            return transcript
+    return None
+
+def get_text_from_google_doc(doc_id):
+    doc = docs_service.documents().get(documentId=doc_id).execute()
+    txt = ""
+    for c in doc['body']['content']:
+        if 'paragraph' in c:
+            for e in c['paragraph'].get('elements', []):
+                txt += e.get('textRun', {}).get('content', '')
+    return txt
+
+def extract_youtube_link_from_transcript(transcript_text):
+    urls = re.findall(r'(https?://[^\s]+)', transcript_text)
+    for url in urls:
+        if "youtu" in url:
+            return url
+    return ""
+
+def extract_info_from_title(title):
+    base_title = title.rsplit(".", 1)[0]
+    parts = [p.strip() for p in base_title.split(" I ")]
+    # Fireside Chat: Fireside Chat I Speaker(s) I Partner Org I Event
+    if base_title.lower().startswith("fireside chat"):
+        if len(parts) >= 4:
+            full_title = base_title
+            speakers = parts[1]
+            partner = parts[2]
+            event = parts[3]
+        else:
+            full_title, speakers, partner, event = base_title, "", "", ""
+    # Solo: Speaker I Talk Title I Partner Org I Event
+    else:
+        if len(parts) >= 4:
+            speakers = parts[0]
+            full_title = base_title
+            partner = parts[2]
+            event = parts[3]
+        elif len(parts) == 3:
+            speakers = parts[0]
+            full_title = base_title
+            partner = parts[1]
+            event = parts[2]
+        else:
+            speakers, partner, event = "", "", ""
+            full_title = base_title
+    return full_title, speakers, partner, event
+
+def ai_video_analysis(transcript):
+    prompt = (
+        "Given the following transcript of a conference/event video, please:\n"
+        "1. Provide a summary in 1500 characters or fewer, using as many relevant keywords as possible.\n"
+        "2. Generate timestamped YouTube Chapters, beginning with '00:00 Introduction' and logical content or speaker breaks.\n"
+        "3. Generate a single comma-separated list of keywords, not to exceed 500 characters.\n"
+        "Return results as:\nSummary:\n...\nChapters:\n...\nKeywords:\n...\n"
+        "\n\nTranscript:\n"
+        f"{transcript}\n"
+    )
+    chat_resp = client.chat.completions.create(
+        model="gpt-4.1",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+    )
+    output = chat_resp.choices[0].message.content
+    summary, chapters, keywords = "", "", ""
+    if "Summary:" in output: summary = output.split("Summary:")[1].split("Chapters:")[0].strip()
+    if "Chapters:" in output: chapters = output.split("Chapters:")[1].split("Keywords:")[0].strip()
+    if "Keywords:" in output: keywords = output.split("Keywords:")[1].strip()
+    return summary, chapters, keywords
+
+def build_telegram_message(partner, event, youtube_url):
+    return (
+        f"Hey {partner} team! Your video from {event} is now live on our YouTube. "
+        f"You can find the link here: {youtube_url}\n\n"
+        "Don't forget to tag ETHGlobal in any posts and we will be sure to boost and re-share."
+    )
+
+if __name__ == '__main__':
+    video_folder_id = get_folder_id(VIDEO_FOLDER)
+    transcript_folder_id = get_folder_id(TRANSCRIPT_FOLDER)
+    transcript_docs = list_files_in_folder(transcript_folder_id, file_mime="application/vnd.google-apps.document")
+    video_files = list_files_in_folder(video_folder_id)
+
+    print(f"Found {len(video_files)} video(s) and {len(transcript_docs)} transcript doc(s).")
+
+    for file in video_files:
+        all_titles = worksheet.col_values(2)  # video titles in col B
+        if file['name'] in all_titles:
+            print(f"{file['name']} already processed. Skipping.\n")
+            continue
+
+        transcript_doc = find_transcript_for_video(transcript_docs, file['name'])
+        if not transcript_doc:
+            print(f"No matching transcript doc for video '{file['name']}'. Skipping.")
+            continue
+
+        print(f"Processing {file['name']} (using transcript doc: {transcript_doc['name']})")
+
+        transcript_text = get_text_from_google_doc(transcript_doc['id'])
+        full_title, speakers, partner, event = extract_info_from_title(file['name'])
+
+        # --- HYPERLINKS
+        video_drive_link = make_hyperlink(file['webViewLink'], "Watch Video")
+        transcript_drive_link = make_hyperlink(transcript_doc['webViewLink'], "View Transcript")
+        youtube_url = extract_youtube_link_from_transcript(transcript_text)
+        youtube_hyperlink = make_hyperlink(youtube_url, "Watch on YouTube") if youtube_url else ""
+
+        # --- AI OUTPUTS
+        summary, chapters, keywords = ai_video_analysis(transcript_text)
+
+        # --- TELEGRAM MESSAGE
+        telegram_message = build_telegram_message(partner, event, youtube_url)
+
+        worksheet.append_row([
+            time.strftime("%Y-%m-%d"),        # A Date Uploaded
+            full_title,                       # B Video Title
+            event,                            # C Event Name
+            speakers,                         # D Speaker(s)
+            partner,                          # E Partner Organization
+            video_drive_link,                 # F Video Upload Link (Google Drive, as hyperlink)
+            transcript_drive_link,            # G Transcript Upload Link (Google Drive, as hyperlink)
+            youtube_hyperlink,                # H YouTube Link (hyperlink or blank)
+            summary,                          # I Summary (AI)
+            chapters,                         # J Chapters (AI)
+            keywords,                         # K Keywords (AI)
+            telegram_message,                 # L Telegram Message for Partner Org
+            ""                                # M Notes
+        ], value_input_option="USER_ENTERED")
+        print(f"Sheet row for {file['name']} written!\n")
+
+    print("DONE.")
